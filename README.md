@@ -25,7 +25,7 @@
 
 **1. Clone the Repository**
 ```bash
-git clone https://github.com/aalto-speech/mtkd4ser.git
+git clone https://github.com/Javeria530/multilengual-emotion-recognation-system.git
 ```
 ```bash
 cd mtkd4ser
