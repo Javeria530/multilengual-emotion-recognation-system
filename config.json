@@ -1,0 +1,7 @@
+{
+  "ce_weight": 1.0,
+  "kd_weight": 1.0,
+  "contrastive_weight": 0.1,
+  "attention_hidden_dim": 16,
+  "contrastive_temperature": 0.07
+}
