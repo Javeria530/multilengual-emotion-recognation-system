@@ -1,3 +1,5 @@
+import os
+BASE_DIR = os.environ.get("MTKD_BASE_DIR", "/m/triton/scratch/elec/t405-puhe/p/bijoym1")
 import torch
 import os
 from tqdm import tqdm
@@ -8,7 +10,8 @@ from utils import (
     validation,
     train_mtkd,
     train_kd,
-    train
+    train,
+    precompute_teacher_logits
 )
 from models import AttentionMTKD
 from torch.utils.tensorboard import SummaryWriter
@@ -25,7 +28,7 @@ def pipeline_ft(model, train_loader, valid_loader, test_loader, hyperparam, devi
     LINGUALITY = hyperparam['LINGUALITY']
     LANGUAGE = hyperparam['LANGUAGE']
 
-    # file_path = f"/m/triton/scratch/elec/t405-puhe/p/bijoym1/SER/FTWav2Vec2/checkpoints/ft/FT_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
+    # file_path = f"{BASE_DIR}/SER/FTWav2Vec2/checkpoints/ft/FT_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
     file_path = f"/content/FT_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
 
     optimizer = torch.optim.AdamW(model.parameters(), lr = LEARNING_RATE)
@@ -42,7 +45,7 @@ def pipeline_ft(model, train_loader, valid_loader, test_loader, hyperparam, devi
         print("Model checkpoint has been loaded")
     
     # Initialize TensorBoard writer
-    # writer = SummaryWriter(log_dir=f"/m/triton/scratch/elec/t405-puhe/p/bijoym1/SER/FTWav2Vec2/tensorboards/FT_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
+    # writer = SummaryWriter(log_dir=f"{BASE_DIR}/SER/FTWav2Vec2/tensorboards/FT_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
     writer = SummaryWriter(log_dir=f"/content/tensorboards/FT_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
 
     if TRAINING == 0: # No training, test/validation only
@@ -115,7 +118,7 @@ def pipeline_kd(teacher, student, train_loader, valid_loader, test_loader, hyper
     LINGUALITY = hyperparam['LINGUALITY']
     LANGUAGE = hyperparam['LANGUAGE']
 
-    file_path_student = f"/m/triton/scratch/elec/t405-puhe/p/bijoym1/SER/FTWav2Vec2/checkpoints/kd/KD_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
+    file_path_student = f"{BASE_DIR}/SER/FTWav2Vec2/checkpoints/kd/KD_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
 
     optimizer_ce = torch.optim.AdamW(student.parameters(), lr = LEARNING_RATE)
     optimizer_kl = torch.optim.AdamW(student.parameters(), lr = LEARNING_RATE)
@@ -134,7 +137,7 @@ def pipeline_kd(teacher, student, train_loader, valid_loader, test_loader, hyper
         print("Student model checkpoint has been loaded")
 
     # Initialize TensorBoard writer
-    writer = SummaryWriter(log_dir=f"/m/triton/scratch/elec/t405-puhe/p/bijoym1/SER/FTWav2Vec2/tensorboards/KD_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
+    writer = SummaryWriter(log_dir=f"{BASE_DIR}/SER/FTWav2Vec2/tensorboards/KD_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
 
     lambda_param=0.75
 
@@ -221,8 +224,15 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
     contrastive_weight = hyperparam.get('contrastive_weight', 0.0)
     contrastive_temp = hyperparam.get('contrastive_temp', 0.07)
     attention_hidden_dim = hyperparam.get('attention_hidden_dim', 16)
+    teacher_dims = hyperparam.get('teacher_dims', None)  # heterogeneous-teacher support; None = homogeneous
 
-    file_path_student = f"/m/triton/scratch/elec/t405-puhe/p/bijoym1/SER/FTWav2Vec2/checkpoints/mtkd/MTKD_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
+    # --- Low-memory / low-compute training options ---
+    use_amp = hyperparam.get('use_amp', False)
+    grad_accum_steps = hyperparam.get('grad_accum_steps', 1)
+    use_grad_checkpointing = hyperparam.get('use_grad_checkpointing', False)
+    precompute_teachers = hyperparam.get('precompute_teachers', False)
+
+    file_path_student = f"{BASE_DIR}/SER/FTWav2Vec2/checkpoints/mtkd/MTKD_{LINGUALITY}_{LANGUAGE}_S{SESSION}.pth"
 
     # Initialize attention network if active
     attention_net = None
@@ -230,20 +240,50 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
         attention_net = AttentionMTKD(
             num_classes=student.config.num_labels, 
             hidden_dim=attention_hidden_dim, 
-            num_teachers=3
+            num_teachers=3,
+            teacher_dims=teacher_dims,
         )
         attention_net.to(device)
 
-    # Set up optimizer parameters to include attention network if training with attention
+    if use_grad_checkpointing and hasattr(student, "gradient_checkpointing_enable"):
+        student.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled on student (trades compute for activation memory).")
+
+    # Set up a SINGLE optimizer (the previous optimizer_ce/optimizer_kl pair
+    # both wrapped the exact same parameters and only optimizer_ce.step() was
+    # ever called -- optimizer_kl did nothing but double Adam's optimizer-state
+    # memory. One optimizer is functionally identical and roughly halves
+    # optimizer memory.)
     if attention_net is not None:
         params = list(student.parameters()) + list(attention_net.parameters())
     else:
         params = list(student.parameters())
 
-    optimizer_ce = torch.optim.AdamW(params, lr = LEARNING_RATE)
-    optimizer_kl = torch.optim.AdamW(params, lr = LEARNING_RATE)
+    optimizer = torch.optim.AdamW(params, lr=LEARNING_RATE)
     loss_fn_ce = torch.nn.CrossEntropyLoss()
     loss_fn_kl = torch.nn.KLDivLoss(reduction='mean')
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # --- One-time teacher logit caching (biggest memory/compute win) ---
+    # Teachers are frozen, so their outputs never change across epochs.
+    # Computing them once here and freeing the teacher models from the GPU
+    # means the rest of training only ever holds ONE Wav2Vec2 model
+    # (the student) in GPU memory instead of four.
+    cached_train_logits = None
+    cached_valid_logits = None
+    cached_test_logits = None
+    if precompute_teachers:
+        print("Precomputing teacher logits once (this replaces per-step teacher forward passes)...")
+        cached_train_logits = precompute_teacher_logits(teacher_en, teacher_fi, teacher_fr, train_loader, device)
+        cached_valid_logits = precompute_teacher_logits(teacher_en, teacher_fi, teacher_fr, valid_loader, device)
+        cached_test_logits = precompute_teacher_logits(teacher_en, teacher_fi, teacher_fr, test_loader, device)
+
+        # Teachers are no longer needed on the GPU at all.
+        teacher_en.to("cpu")
+        teacher_fi.to("cpu")
+        teacher_fr.to("cpu")
+        torch.cuda.empty_cache()
+        print("Teacher models moved off GPU; training now only holds the student in GPU memory.")
 
     epoch = 1
     if os.path.exists(file_path_student):
@@ -251,15 +291,14 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
         student.load_state_dict(checkpoint['model_state_dict'])
         if attention_net is not None and 'attention_net_state_dict' in checkpoint:
             attention_net.load_state_dict(checkpoint['attention_net_state_dict'])
-        optimizer_ce.load_state_dict(checkpoint['optimizer_ce_state_dict'])
-        optimizer_kl.load_state_dict(checkpoint['optimizer_kl_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint['epoch']
         total_train_loss = checkpoint['training loss']
         total_valid_loss = checkpoint['validation loss']
         print("Student model checkpoint has been loaded")
 
     # Initialize TensorBoard writer
-    writer = SummaryWriter(log_dir=f"/m/triton/scratch/elec/t405-puhe/p/bijoym1/SER/FTWav2Vec2/tensorboards/MTKD_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
+    writer = SummaryWriter(log_dir=f"{BASE_DIR}/SER/FTWav2Vec2/tensorboards/MTKD_{LINGUALITY}_{LANGUAGE}_S{SESSION}")
 
     if TRAINING == 0: # No training, test/validation only
         (
@@ -277,7 +316,8 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
             ce_weight=ce_weight,
             kd_weight=kd_weight,
             contrastive_weight=contrastive_weight,
-            contrastive_temp=contrastive_temp
+            contrastive_temp=contrastive_temp,
+            cached_teacher_logits=cached_test_logits
         )
         print(f"Epoch {epoch}/{N_EPOCHS}, Test Recall (unweighted): {test_unweighted_recall}, Test Recall (weighted): {test_weighted_recall}, Test Accuracy: {test_accuracy}, Test Loss: {total_test_loss}, KLD Loss: {total_kl_loss}, CE Loss: {total_ce_loss}, SCL Loss: {total_contrastive_loss}\n")
         print(f"Average Attention Weights during Validation: EN = {val_attention_weights[0]:.4f}, FI = {val_attention_weights[1]:.4f}, FR = {val_attention_weights[2]:.4f}")
@@ -296,7 +336,7 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
             ) = train_mtkd(
                 teacher_en, teacher_fi, teacher_fr, student,
                 tqdm(train_loader, desc=f"Epoch {epoch}/{N_EPOCHS}, Training", leave=False),
-                optimizer_ce, optimizer_kl, 
+                optimizer,
                 loss_fn_ce, loss_fn_kl,
                 device,
                 attention_net=attention_net,
@@ -304,7 +344,11 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
                 ce_weight=ce_weight,
                 kd_weight=kd_weight,
                 contrastive_weight=contrastive_weight,
-                contrastive_temp=contrastive_temp
+                contrastive_temp=contrastive_temp,
+                cached_teacher_logits=cached_train_logits,
+                use_amp=use_amp,
+                scaler=scaler,
+                grad_accum_steps=grad_accum_steps
             )
             print(f"Epoch {epoch}/{N_EPOCHS}, Training Recall (unweighted): {train_unweighted_recall:.4f}, Recall (weighted): {train_weighted_recall:.4f}, Accuracy: {train_accuracy:.4f}, Loss: {total_train_loss:.4f}, KLD Loss: {total_kl_loss:.4f}, CE Loss: {total_ce_loss:.4f}, SCL Loss: {total_contrastive_loss:.4f}")
             print(f"Average Attention Weights: EN = {train_attention_weights[0]:.4f}, FI = {train_attention_weights[1]:.4f}, FR = {train_attention_weights[2]:.4f}")
@@ -336,7 +380,8 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
                 ce_weight=ce_weight,
                 kd_weight=kd_weight,
                 contrastive_weight=contrastive_weight,
-                contrastive_temp=contrastive_temp
+                contrastive_temp=contrastive_temp,
+                cached_teacher_logits=cached_valid_logits
             )
             print(f"Epoch {epoch}/{N_EPOCHS}, Validation Recall (unweighted): {test_unweighted_recall:.4f}, Recall (weighted): {test_weighted_recall:.4f}, Accuracy: {test_accuracy:.4f}, Loss: {total_test_loss:.4f}, KLD Loss: {total_kl_loss_val:.4f}, CE Loss: {total_ce_loss_val:.4f}, SCL Loss: {total_contrastive_loss_val:.4f}\n")
             print(f"Validation Average Attention Weights: EN = {val_attention_weights[0]:.4f}, FI = {val_attention_weights[1]:.4f}, FR = {val_attention_weights[2]:.4f}")
@@ -359,8 +404,7 @@ def pipeline_mtkd(teacher_en, teacher_fi, teacher_fr, student, train_loader, val
                 save_dict = {
                     'epoch': epoch,
                     'model_state_dict': student.state_dict(),
-                    'optimizer_ce_state_dict': optimizer_ce.state_dict(),
-                    'optimizer_kl_state_dict': optimizer_kl.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
                     'training loss': total_train_loss,
                     'validation loss': total_test_loss
                 }

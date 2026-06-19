@@ -9,7 +9,7 @@ from datasets import DatasetDict, concatenate_datasets
 from transformers import Wav2Vec2FeatureExtractor
 from utils import preprocess_function, collate_fn
 from models import model_mtkd, model_kd, model_ft
-from data import iemocap, fesc, cafe
+from data import iemocap, fesc, cafe, low_resource_lang
 from pipeline import pipeline_mtkd, pipeline_kd, pipeline_ft
 import warnings
 warnings.filterwarnings('ignore')
@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--SESSION", help="Session/Split Number", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9])
     parser.add_argument("--TRAINING", help="1: Yes, 0: No", type=int, default=0, choices=[0, 1])
     parser.add_argument("--PARADIGM", help="Choose a Training Paradigm: FT, KD, or MTKD", type=str, default="MTKD", choices=["FT", "KD", "MTKD"])
-    parser.add_argument("--LANGUAGE", help="Choose a Language: English (EN), Finnish (FI), or French (FR)", type=str, default="EN", choices=["EN", "FI", "FR"])
+    parser.add_argument("--LANGUAGE", help="Choose a Language: English (EN), Finnish (FI), French (FR), or a new low-resource language (LOW_RESOURCE)", type=str, default="EN", choices=["EN", "FI", "FR", "LOW_RESOURCE"])
     parser.add_argument("--LINGUALITY", help="Choose the Linguality: Monolingual or Multilingual", type=str, default="Monolingual", choices=["Monolingual", "Multilingual"])
     parser.add_argument("--teacher_selection", help="Ablation: teacher weighting mechanism", type=str, default="cosine", choices=["cosine", "attention"])
     parser.add_argument("--config_path", help="Path to config file", type=str, default="config.json")
@@ -31,6 +31,14 @@ def main():
     parser.add_argument("--contrastive_weight", help="Weight for supervised contrastive loss", type=float, default=None)
     parser.add_argument("--contrastive_temp", help="Temperature for contrastive loss", type=float, default=None)
     parser.add_argument("--attention_hidden_dim", help="Hidden dimension for AttentionMTKD network", type=int, default=None)
+    # --- Low-memory / low-compute training flags ---
+    parser.add_argument("--use_amp", help="Enable mixed-precision (fp16) training", action="store_true")
+    parser.add_argument("--grad_accum_steps", help="Accumulate gradients over N steps to simulate a larger batch on limited GPU memory", type=int, default=1)
+    parser.add_argument("--use_grad_checkpointing", help="Enable gradient checkpointing on the student to trade compute for activation memory", action="store_true")
+    parser.add_argument("--precompute_teachers", help="Precompute and cache all teacher logits once, then free teachers from GPU memory for the rest of training", action="store_true")
+    # --- New low-resource language (LANGUAGE=LOW_RESOURCE) ---
+    parser.add_argument("--train_manifest", help="Path to train manifest csv/tsv for a new low-resource language", type=str, default=None)
+    parser.add_argument("--test_manifest", help="Path to test manifest csv/tsv for a new low-resource language", type=str, default=None)
     args = parser.parse_args()
 
     random_seed = 42
@@ -53,12 +61,16 @@ def main():
         raise ValueError("Error: English dataset IEMOCAP does not have more than five splits!")
     elif LANGUAGE == "FR" and SESSION > 1:
         raise ValueError("Error: French dataset CaFE does not have more than five splits!")
+    elif LANGUAGE == "LOW_RESOURCE" and (args.train_manifest is None or args.test_manifest is None):
+        raise ValueError("Error: LANGUAGE=LOW_RESOURCE requires --train_manifest and --test_manifest.")
 
     if  LINGUALITY == "Monolingual":
         if LANGUAGE == "EN":
             label2id, id2label, ds = iemocap(SESSION)
         elif LANGUAGE == "FI":
             label2id, id2label, ds = fesc(SESSION)
+        elif LANGUAGE == "LOW_RESOURCE":
+            label2id, id2label, ds = low_resource_lang(args.train_manifest, args.test_manifest)
         else: # LANGUAGE == "FR"
             label2id, id2label, ds = cafe(SESSION)
 
@@ -90,6 +102,14 @@ def main():
     print(ds)
     print(label2id)
     print(id2label)
+
+    # Inject a stable per-sample index BEFORE feature extraction. This lets
+    # precomputed teacher logits be looked up by idx regardless of any later
+    # shuffling in the DataLoader -- needed for --precompute_teachers.
+    ds = DatasetDict({
+        split: ds[split].map(lambda example, i: {"idx": i}, with_indices=True)
+        for split in ds
+    })
 
     MODEL_CKPT = "facebook/wav2vec2-base"
     NUM_OF_LABELS = len(label2id)
@@ -132,7 +152,11 @@ def main():
         "kd_weight": kd_weight,
         "contrastive_weight": contrastive_weight,
         "contrastive_temp": contrastive_temp,
-        "attention_hidden_dim": attention_hidden_dim
+        "attention_hidden_dim": attention_hidden_dim,
+        "use_amp": args.use_amp,
+        "grad_accum_steps": args.grad_accum_steps,
+        "use_grad_checkpointing": args.use_grad_checkpointing,
+        "precompute_teachers": args.precompute_teachers,
     }
 
     if PARADIGM == "MTKD":

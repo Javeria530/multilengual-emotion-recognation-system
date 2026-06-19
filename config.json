@@ -3,5 +3,10 @@
   "kd_weight": 1.0,
   "contrastive_weight": 0.1,
   "attention_hidden_dim": 16,
-  "contrastive_temperature": 0.07
+  "contrastive_temperature": 0.07,
+  "use_amp": true,
+  "grad_accum_steps": 4,
+  "use_grad_checkpointing": true,
+  "precompute_teachers": true,
+  "teacher_dims": null
 }
