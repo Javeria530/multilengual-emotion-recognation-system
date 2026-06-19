@@ -17,7 +17,7 @@
 </div>
 
 ## Run on Colab
-* Run the notebook: [**mtkd4ser.ipynb**](https://github.com/Javeria530/multilengual-emotion-recognation-system/blob/main/mtkd4ser.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Javeria530/multilengual-emotion-recognation-system/blob/main/mtkd4ser.ipynb)
+* Run the notebook: [**Colab_Training.ipynb**](https://github.com/Javeria530/multilengual-emotion-recognation-system/blob/main/Colab_Training.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Javeria530/multilengual-emotion-recognation-system/blob/main/Colab_Training.ipynb)
 
 
 
